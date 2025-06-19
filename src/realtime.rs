@@ -148,7 +148,8 @@ impl RealtimeChannel {
 pub struct RealtimeClient {
     pub realtime_url: String,
     pub subscriptions: Arc<Mutex<HashMap<String, RealtimeChannel>>>,
-    access_token: Option<String>,
+    access_token: Arc<Mutex<Option<String>>>,
+    access_token_updater: Arc<SegQueue<String>>,
     command_queue: Arc<SegQueue<Command>>,
 }
 
@@ -167,7 +168,8 @@ impl RealtimeClient {
         Self {
             realtime_url,
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
-            access_token,
+            access_token: Arc::new(Mutex::new(access_token)),
+            access_token_updater: Arc::new(SegQueue::new()),
             command_queue: Arc::new(SegQueue::new()),
         }
     }
@@ -199,6 +201,12 @@ impl RealtimeClient {
         channel
     }
 
+    pub fn update_access_token(&self, new_token: impl Into<String>) {
+        let token = new_token.into();
+        *self.access_token.lock().unwrap() = Some(token.clone());
+        self.access_token_updater.push(token.clone());
+    }
+
     pub async fn process(&self) {
         let websocket = reqwest_websocket::websocket(&self.realtime_url)
             .await
@@ -213,8 +221,9 @@ impl RealtimeClient {
         loop {
             let message_stream = receiver.try_next().fuse();
             let queue_stream = poll_queue(self.command_queue.clone()).fuse();
+            let access_token_stream = poll_queue(self.access_token_updater.clone()).fuse();
 
-            futures::pin_mut!(message_stream, queue_stream);
+            futures::pin_mut!(message_stream, queue_stream, access_token_stream);
 
             select! {
                 message = message_stream => {
@@ -254,18 +263,20 @@ impl RealtimeClient {
                                     continue;
                                 }
 
+                                let access_token = self.access_token.lock().unwrap().clone();
+
                                 sender.send(Message::Text(serde_json::to_string(&EventMessage {
                                     topic: channel.topic.clone(),
                                     payload: Events::Join {
                                         config: SubscriptionConfig {
-                                            private: if channel.postgres_changes.len() < 1 { Some(true) } else { None },
-                                            broadcast: if channel.postgres_changes.len() < 1 { Some(BroadcastConfig {
+                                            private: if channel.postgres_changes.is_empty() { Some(true) } else { None },
+                                            broadcast: if channel.postgres_changes.is_empty() { Some(BroadcastConfig {
                                                 self_messages: false,
                                                 ack: false,
                                             }) } else { None },
                                             postgres_changes: channel.postgres_changes.clone()
                                         },
-                                        access_token: self.access_token.clone(),
+                                        access_token,
                                     },
                                     reference: Some(refid.to_string()),
                                     join_ref: None,
@@ -280,7 +291,8 @@ impl RealtimeClient {
                             Command::Unsubscribe(topic) => {
                                 tracing::debug!("unsubscribing from topic: {}", &topic);
 
-                                if let Some(channel) = self.subscriptions.lock().unwrap().remove(&topic) {
+                                let channel = self.subscriptions.lock().unwrap().remove(&topic);
+                                if let Some(channel) = channel {
                                     sender.send(Message::Text(serde_json::to_string(&EventMessage {
                                         topic: topic.clone(),
                                         payload: Events::Leave {},
@@ -289,6 +301,22 @@ impl RealtimeClient {
                                     }).unwrap())).await.unwrap();
                                 }
                             },
+                        }
+                    }
+                },
+                access_token_result = &mut access_token_stream => {
+                    if let Some(new_access_token) = access_token_result {
+                        let topics =  self.subscriptions.lock().unwrap().keys().cloned().collect::<Vec<_>>();
+
+                        for topic in topics {
+                            sender.send(Message::Text(serde_json::to_string(&EventMessage {
+                                topic: topic.clone(),
+                                payload: Events::AccessToken { access_token: new_access_token.clone() },
+                                reference: Some(refid.to_string()),
+                                join_ref: None,
+                            }).unwrap())).await.unwrap();
+
+                            refid += 1;
                         }
                     }
                 },
@@ -314,11 +342,25 @@ pub fn use_realtime_provider(
     supabase_anon_key: &str,
     access_token: Option<String>,
 ) {
-    let client =
-        use_context_provider(|| RealtimeClient::new(supabase_url, supabase_anon_key, access_token));
+    let supabase_url = supabase_url.to_owned();
+    let supabase_anon_key = supabase_anon_key.to_owned();
+    let client = use_signal(use_reactive((&access_token,), move |(access_token,)| {
+        RealtimeClient::new(
+            supabase_url.clone(),
+            supabase_anon_key.clone(),
+            access_token,
+        )
+    }));
+    use_context_provider(|| client);
+
+    use_effect(use_reactive!(|access_token| {
+        if let Some(access_token) = access_token {
+            client().update_access_token(access_token);
+        }
+    }));
 
     use_future(move || {
-        let client = client.clone();
+        let client = client();
 
         async move {
             web! {
@@ -361,8 +403,8 @@ pub fn use_realtime_changes<T: DeserializeOwned>(
     handler: impl FnMut(PostgresChange<T>) + 'static,
 ) {
     let handler = Rc::new(RwLock::new(handler));
-    let client = use_context::<RealtimeClient>();
-    let channel = use_signal(move || client.subscribe(topic, spec));
+    let client = use_context::<Signal<RealtimeClient>>();
+    let channel = use_signal(move || client().subscribe(topic, spec));
 
     use_future(move || {
         let handler = handler.clone();
@@ -396,8 +438,8 @@ pub fn use_realtime_broadcast<T: DeserializeOwned>(
     handler: impl FnMut(T) + 'static,
 ) {
     let handler = Rc::new(RwLock::new(handler));
-    let client = use_context::<RealtimeClient>();
-    let channel = use_signal(move || client.subscribe(topic, spec));
+    let client = use_context::<Signal<RealtimeClient>>();
+    let channel = use_signal(move || client().subscribe(topic, spec));
 
     use_future(move || {
         let handler = handler.clone();
